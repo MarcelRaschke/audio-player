@@ -30,6 +30,7 @@ class AudioView extends HTMLElement {
       <style>
         #parent {
           display: flex;
+          gap: 5px;
           align-items: center;
           background-color: var(--bg-color, #f1f3f4);
           border-radius: 30px;
@@ -39,9 +40,6 @@ class AudioView extends HTMLElement {
           outline: none;
           --height: 5px;
           --progress-bg-color: #000;
-        }
-        #parent > * {
-          margin: 0 5px;
         }
         ::slotted(*),
         #volume,
@@ -80,13 +78,14 @@ class AudioView extends HTMLElement {
         }
         #sound {
           width: 0;
-          padding-left: 5px;
+          padding-left: 0;
           --percent: 50%;
-          transition: width .5s;
+          transition: width .5s, padding-left .5s;
           position: relative;
         }
         #volume:hover > #sound {
           width: 48px;
+          padding-left: 5px;
         }
         #volume:hover > #sound:after {
           content: '';
@@ -99,25 +98,28 @@ class AudioView extends HTMLElement {
           z-index: 1;
           pointer-events: none;
         }
-
       </style>
       <div id="parent" mode="nosrc" data-ready=false tabindex="-1">
         <slot name="before-play"></slot>
         <svg id="play" viewBox="0 0 48 48">
           <path d="M16 10v28l22-14z"/>
           <path d="M12 38h8V10h-8v28zm16-28v28h8V10h-8z"/><path d="M0 0h48v48H0z" fill="none"/>
+          <title>Use Space to toggle play and pause</title>
         </svg>
         <slot name="before-stat"></slot>
         <span id="current">0:00</span>
-        <progress-view id="progress"></progress-view>
+        <progress-view id="progress" title="Use Arrow Left/Right to seek 10 seconds backward/forward
+Use Meta + Arrow Left/Right to seek 30 seconds backward/forward"></progress-view>
         <span id="duration">0:00</span>
         <slot name="before-sound"></slot>
-        <div id="volume">
+        <div id="volume" title="Use Arrow Up/Down to increase/decrease 10%
+Use Meta + Arrow Up/Down to increase/decrease 30%">
           <progress-view id="sound"></progress-view>
           <svg viewBox="0 0 48 48">
             <path d="M14 18v12h8l10 10V8L22 18h-8z"/><path d="M0 0h48v48H0z" fill="none"/>
           </svg>
         </div>
+        <slot name="after-sound"></slot>
       </div>
     `;
     this.stat = {
@@ -126,6 +128,13 @@ class AudioView extends HTMLElement {
     };
   }
   connectedCallback() {
+    // prevent open dialog to open on dblclick
+    this.shadowRoot.addEventListener('dblclick', e => {
+      if (e.target.closest('svg')) {
+        e.stopPropagation();
+      }
+    });
+    // progress
     const progress = this.shadowRoot.getElementById('progress');
     progress.addEventListener('seek', e => {
       if (this.audioBuffer) {
@@ -158,7 +167,10 @@ class AudioView extends HTMLElement {
     this.addEventListener('ended', () => progress.seek(100));
 
     this.addEventListener('keydown', e => {
-      if (e.code === 'Space') {
+      if (e.code === 'KeyB' && (e.metaKey || e.ctrlKey) && e.shiftKey) {
+        this.currentTime = 0;
+      }
+      else if (e.code === 'Space') {
         this.toggle();
       }
       else if (e.code === 'ArrowRight') {
@@ -175,9 +187,11 @@ class AudioView extends HTMLElement {
       }
       else if (e.code === 'ArrowUp') {
         this.volume += (e.metaKey || e.ctrlKey) ? 0.3 : 0.1;
+        this.volume = Math.round(this.volume * 10) / 10;
       }
       else if (e.code === 'ArrowDown') {
         this.volume -= (e.metaKey || e.ctrlKey) ? 0.3 : 0.1;
+        this.volume = Math.round(this.volume * 10) / 10;
       }
     });
 
@@ -218,7 +232,7 @@ class AudioView extends HTMLElement {
     }
     const next = () => {
       if (session !== this.session) {
-        return console.log('skipped');
+        return console.info('skipped');
       }
 
       const {context, audioBuffer} = this;
@@ -236,6 +250,7 @@ class AudioView extends HTMLElement {
 
       const sound = this.sound = context.createGain();
       sound.gain.value = this.volume;
+
       sound.connect(context.destination);
       source.connect(sound);
 
@@ -251,7 +266,14 @@ class AudioView extends HTMLElement {
     }
     else {
       const parent = this.shadowRoot.getElementById('parent');
-      arrayBuffer = arrayBuffer || await fetch(this.getAttribute('src')).then(r => r.arrayBuffer());
+      if (!arrayBuffer) {
+        if (this.getAttribute('src')) {
+          arrayBuffer = await fetch(this.getAttribute('src')).then(r => r.arrayBuffer());
+        }
+      }
+      if (!arrayBuffer) {
+        throw Error('EMPTY_BUFFER');
+      }
 
       try {
         parent.setAttribute('mode', 'nosrc');
@@ -262,7 +284,7 @@ class AudioView extends HTMLElement {
         Object.assign(this, decoded);
       }
       catch (e) {
-        console.log('FFmpeg Decoder Failed', e);
+        console.info('FFmpeg Decoder Failed', e);
         try {
           const context = new AudioContext();
           const audioBuffer = await context.decodeAudioData(arrayBuffer);
@@ -273,6 +295,8 @@ class AudioView extends HTMLElement {
           });
         }
         catch (ee) {
+          console.info('Native Decoder Failed', ee);
+
           this.reset();
           return this.dispatchEvent(new CustomEvent('error', {
             detail: e.message

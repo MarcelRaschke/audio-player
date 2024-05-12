@@ -1,5 +1,7 @@
-/* global drag */
+/* global drag, launchQueue */
 'use strict';
+
+const args = new URLSearchParams(location.search);
 
 const audio = document.getElementById('audio');
 Object.defineProperty(audio, 'file', {
@@ -9,6 +11,10 @@ Object.defineProperty(audio, 'file', {
 });
 const next = document.getElementById('next');
 const previous = document.getElementById('previous');
+
+if (isNaN(localStorage.volume) === false) {
+  audio.volume = Number(localStorage.getItem('volume'));
+}
 
 const meta = (m = {}) => {
   document.getElementById('codec-name').textContent = m['Codec Long Name'] || '-';
@@ -31,18 +37,121 @@ const title = (msg = '') => {
   }
 };
 
+const get = (href, progress) => {
+  if (href.startsWith('filesystem:')) { // fetch does not work with this scheme
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', href, true);
+      xhr.responseType = 'arraybuffer';
+
+      xhr.onprogress = e => {
+        if (e.lengthComputable) {
+          progress(e.loaded, e.total);
+        }
+      };
+
+      xhr.onreadystatechange = () => {
+        if (xhr.readyState === 4) {
+          if (xhr.status === 200) {
+            resolve(xhr.response);
+          }
+          else {
+            reject(xhr.status);
+          }
+        }
+      };
+      xhr.send();
+    });
+  }
+  else {
+    return fetch(href).then(response => {
+      const contentLength = response.headers.get('Content-Length');
+      const total = parseInt(contentLength, 10);
+      let loaded = 0;
+
+      const reader = response.body.getReader();
+      const segments = [];
+
+      return new Promise((resolve, reject) => {
+        function read() {
+          reader.read().then(({done, value}) => {
+            if (done) {
+              new Blob(segments.map(s => s.buffer)).arrayBuffer().then(resolve);
+              return;
+            }
+
+            loaded += value.length;
+            progress(loaded, total);
+            segments.push(value);
+
+            read();
+          }).catch(reject);
+        }
+        read();
+      });
+    });
+  }
+};
+
+const format = (bytes, decimals) => {
+  if (bytes == 0) {
+    return '0 Bytes';
+  }
+  const k = 1024;
+  const dm = decimals || 2;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+};
+
 const play = () => {
   const i = audio.i || 0;
+
+  document.getElementById('view').selectedIndex = i + 1;
+
   previous.setAttribute('disabled', i === 0);
   next.setAttribute('disabled', i >= audio.files.length - 1);
 
-  const reader = new FileReader();
-  reader.onload = () => {
+  const done = buffer => {
     audio.file.count = (audio.file.count || 0) + 1;
-    audio.play(reader.result);
+    audio.play(buffer).catch(e => {
+      document.title = (e.message || e);
+      console.error(e);
+    });
     title();
   };
-  reader.readAsArrayBuffer(audio.file);
+
+  if (audio.file) {
+    if (audio.file.href) {
+      get(audio.file.href, (s, m) => {
+        let msg = 'Buffering ';
+
+        msg += format(s, 1);
+
+        if (m) {
+          msg += ' / ' + format(m, 1);
+          msg += ' [' + (s / m * 100).toFixed(1) + '%]';
+        }
+        document.title = msg + '...';
+      }).then(done).catch(e => alert(e.message));
+    }
+    else {
+      const reader = new FileReader();
+      reader.onload = () => {
+        done(reader.result);
+      };
+      reader.readAsArrayBuffer(audio.file);
+    }
+  }
+};
+
+document.getElementById('view').onchange = e => {
+  const n = e.target.selectedIndex;
+
+  if (n > 0 && audio.i + 1 !== n) {
+    audio.i = n - 1;
+    play();
+  }
 };
 
 const navigate = (direction = 'forward', forced = false) => {
@@ -80,7 +189,14 @@ const navigate = (direction = 'forward', forced = false) => {
     play();
   }
 };
-previous.addEventListener('click', () => navigate('backward', true));
+previous.addEventListener('click', e => {
+  if (e.shiftKey) {
+    audio.currentTime = 0;
+  }
+  else {
+    navigate('backward', true);
+  }
+});
 next.addEventListener('click', () => navigate('forward', true));
 
 {
@@ -132,6 +248,7 @@ document.addEventListener('click', () => {
   let cid;
   audio.addEventListener('volumechange', () => {
     title('Volume Level: ' + (audio.volume * 100).toFixed(0) + '%');
+    localStorage.setItem('volume', audio.volume);
     clearTimeout(cid);
     cid = setTimeout(() => title(), 1000);
   });
@@ -156,16 +273,61 @@ document.addEventListener('click', () => {
   });
 }
 
-chrome.runtime.connect({
-  name: 'player'
-});
+const add = files => {
+  audio.i = audio.i || 0;
+  audio.files = audio.files || [];
 
-drag.onDrag(files => {
-  audio.i = 0;
-  audio.files = files;
+  if (audio.files.length && files.length) {
+    audio.i += 1;
+  }
+
+  const view = document.getElementById('view');
+  for (const file of files) {
+    const n = audio.files.push(file);
+
+    view.option([
+      {name: file.name},
+      {name: file.href}
+    ], file.name, n, false).insert();
+  }
 
   if (audio.files.length) {
     play();
     audio.focus();
   }
+};
+
+drag.onDrag(add);
+chrome.runtime.onMessage.addListener((request, sender, response) => {
+  if (request.method === 'jobs') {
+    add(request.jobs);
+    response(true);
+    chrome.runtime.sendMessage({
+      method: 'bring-to-front'
+    });
+  }
+  else if (request.method === 'ping') {
+    response('pong');
+    chrome.runtime.sendMessage({
+      method: 'bring-to-front'
+    });
+  }
+});
+if (args.has('json')) {
+  setTimeout(() => {
+    const jobs = JSON.parse(args.get('json'));
+    add(jobs);
+  }, 0);
+}
+
+launchQueue.setConsumer(async launchParams => {
+  if (!launchParams.files || !launchParams.files.length) {
+    return;
+  }
+  const files = [];
+  for (const fileHandle of launchParams.files) {
+    const file = await fileHandle.getFile();
+    files.push(file);
+  }
+  add(files);
 });
